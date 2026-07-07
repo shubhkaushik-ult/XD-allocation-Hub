@@ -1,0 +1,6 @@
+.vercel
+*.json
+!vercel.json
+*.xlsx
+__pycache__/
+outputs/
