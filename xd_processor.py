@@ -446,15 +446,15 @@ def build_pivot_vertical(indent_df: pd.DataFrame, city_key: str = "trichy") -> p
             s_id = st[supp_col]
             s_qty = st["Qty"]
             # Add Supplier ID header row
-            rows.append([s_id, s_qty])
+            rows.append([s_id, s_qty, ""])
             # Add Vertical items under this supplier
             s_items = grouped[grouped[supp_col] == s_id]
             for _, item in s_items.iterrows():
-                rows.append([f"  {item['VERTICAL']}", item["Qty"]])
+                rows.append([f"  {item['VERTICAL']}", item["Qty"], ""])
                 
         # Create DataFrame
-        pv = pd.DataFrame(rows, columns=["Row Labels", "Sum of QTY"])
-        grand_total = pd.DataFrame([["Grand Total", sub_totals["Qty"].sum()]], columns=pv.columns)
+        pv = pd.DataFrame(rows, columns=["Row Labels", "Sum of QTY", "Mismatch Error"])
+        grand_total = pd.DataFrame([["Grand Total", sub_totals["Qty"].sum(), ""]], columns=pv.columns)
         return pd.concat([pv, grand_total], ignore_index=True)
     else:
         pv = indent_df.groupby("VERTICAL", as_index=False)["Qty"].sum()
@@ -552,8 +552,12 @@ def _auto_width(ws, min_w=10, max_w=40):
 
 
 def _write_df_to_sheet(ws, df: pd.DataFrame, title_row: str = None,
-                        match_col: str = None, total_last_row: bool = False):
+                        match_col: str = None, total_last_row: bool = False,
+                        formula_map: dict = None):
     """Generic helper – writes header + data rows with formatting."""
+    if formula_map is None:
+        formula_map = {}
+
     start_row = 1
     if title_row:
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(df.columns))
@@ -575,9 +579,23 @@ def _write_df_to_sheet(ws, df: pd.DataFrame, title_row: str = None,
         is_subtotal = (str(row[0]).endswith(" Total") or str(row[0]) == "Total") and not is_total
         is_alt   = (row_idx % 2 == 0)
 
+        # Precompute formula formatting arguments for dynamic cells
+        fmt_args = {"row": row_idx}
+        for c_idx, c_name in enumerate(df.columns, 1):
+            fmt_args[f"{c_name}_col"] = get_column_letter(c_idx)
+            fmt_args[f"{c_name}_cell"] = f"{get_column_letter(c_idx)}{row_idx}"
+
         for col_idx, value in enumerate(row, 1):
-            cell = ws.cell(row=row_idx, column=col_idx, value=value)
             col_name = df.columns[col_idx - 1]
+
+            # Inject formula if mapped
+            if not is_total and not is_subtotal and col_name in formula_map:
+                try:
+                    value = formula_map[col_name].format(**fmt_args)
+                except KeyError:
+                    pass
+
+            cell = ws.cell(row=row_idx, column=col_idx, value=value)
 
             # colour match / mismatch column
             if match_col and col_name == match_col:
@@ -593,10 +611,10 @@ def _write_df_to_sheet(ws, df: pd.DataFrame, title_row: str = None,
             is_date_col = "date" in col_name.lower()
 
             if is_total:
-                _data_style(cell, bold=True, bg=CLR["total_bg"], align="right" if isinstance(value, (int, float)) else "left")
+                _data_style(cell, bold=True, bg=CLR["total_bg"], align="right" if isinstance(value, (int, float)) or str(value).startswith("=") else "left")
             elif is_subtotal:
-                _data_style(cell, bold=True, bg=CLR["subtotal_bg"], align="right" if isinstance(value, (int, float)) else "left")
-            elif isinstance(value, (int, float)):
+                _data_style(cell, bold=True, bg=CLR["subtotal_bg"], align="right" if isinstance(value, (int, float)) or str(value).startswith("=") else "left")
+            elif isinstance(value, (int, float)) or str(value).startswith("="):
                 _data_style(cell, bg=None if not is_alt else CLR["alt_row"], align="right", num_fmt="#,##0")
             elif isinstance(value, (dt.date, dt.datetime)) or is_date_col:
                 _data_style(cell, bg=None if not is_alt else CLR["alt_row"], align="center", num_fmt="mm-dd-yy")
@@ -628,6 +646,21 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
 
     print(f"[{city_label}] [6/7] Building store summary ...")
     store_df, total_stores = build_store_summary(indent_df)
+
+    # Store comparison vs Yesterday
+    try:
+        from datetime import timedelta
+        yday = target_date - timedelta(days=1)
+        yday_df = fetch_indent_sheet(yday, city_key)
+        yday_stores = set(yday_df["Store"].dropna().unique()) if "Store" in yday_df.columns else set()
+        today_stores = set(indent_df["Store"].dropna().unique()) if "Store" in indent_df.columns else set()
+        added_stores = sorted(list(today_stores - yday_stores))
+        removed_stores = sorted(list(yday_stores - today_stores))
+        store_compare_status = "ok"
+    except Exception as e:
+        added_stores = []
+        removed_stores = []
+        store_compare_status = str(e)
 
     print(f"[{city_label}] [7/7] Writing Excel ...")
     wb = Workbook()
@@ -702,7 +735,6 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
         po_out = po_out.sort_values(["Vertical", "FSN", "Warehouse"]).reset_index(drop=True)
         
     _write_df_to_sheet(ws_po, po_out)
-    ws_po.freeze_panes = "A3"
     _auto_width(ws_po)
 
 
@@ -764,18 +796,31 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
                     align="right" if col_idx > 1 else "left",
                     num_fmt="#,##0" if col_idx > 1 else None)
     
-    ws_vld.freeze_panes = "A4"
     _auto_width(ws_vld)
 
     # ── Sheet 2 : Indent Summary ────────────────────────────────────────
     ws_indent = wb.create_sheet("Indent Summary")
+    
+    po_out_cols = list(po_out.columns)
+    qty_col_name = "QTY" if "QTY" in po_out_cols else ("PO qty" if "PO qty" in po_out_cols else "Qty")
+    fsn_col_name = "FSN"
+    
+    po_qty_col = get_column_letter(po_out_cols.index(qty_col_name) + 1)
+    po_fsn_col = get_column_letter(po_out_cols.index(fsn_col_name) + 1)
+    
+    indent_formula_map = {
+        "PO_Qty": f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_fsn_col}:${po_fsn_col}, {{FSN_cell}})",
+        "Difference": "={Indent_Qty_cell}-{PO_Qty_cell}",
+        "Match": '=IF({Difference_cell}=0, "✅ Match", "❌ Mismatch")'
+    }
+
     _write_df_to_sheet(
         ws_indent, indent_summary,
         # title_row=f"Indent Cross-Verification  |  {date_str}",
         match_col="Match",
         total_last_row=False,
+        formula_map=indent_formula_map
     )
-    ws_indent.freeze_panes = "A3"
     _auto_width(ws_indent)
 
     # Add a totals row at the bottom of Indent Summary
@@ -793,21 +838,50 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
 
     # ── Sheet 3 : Pivot by Vertical ─────────────────────────────────────
     ws_pv1 = wb.create_sheet("Pivot – Vertical")
+    
+    po_vert_col = get_column_letter(po_out_cols.index("Vertical" if "Vertical" in po_out_cols else "VERTICAL") + 1)
+    
+    formula_map_pv1 = {}
+    if city_key not in ["mumbai", "bengaluru"]:
+        formula_map_pv1["Total_Qty"] = f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_vert_col}:${po_vert_col}, {{Vertical_cell}})"
+        
     _write_df_to_sheet(
         ws_pv1, pv_vertical,
         title_row=f"Qty by Vertical  |  {date_str}",
         total_last_row=True,
+        formula_map=formula_map_pv1
     )
+    
+    if city_key in ["mumbai", "bengaluru"]:
+        po_supp_col = "Supplier ID" if "Supplier ID" in po_out_cols else "SLA"
+        po_supp_col_ltr = get_column_letter(po_out_cols.index(po_supp_col) + 1)
+        
+        current_supplier_cell = None
+        last_row = 3 + len(pv_vertical) - 1 # excluding Grand Total
+        for r in range(3, last_row):
+            lbl = ws_pv1.cell(row=r, column=1).value
+            if lbl and str(lbl).startswith("  "):
+                ws_pv1.cell(row=r, column=2).value = f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_supp_col_ltr}:${po_supp_col_ltr}, {current_supplier_cell}, 'PO'!${po_vert_col}:${po_vert_col}, TRIM(A{r}))"
+                ws_pv1.cell(row=r, column=3).value = f'=IF(COUNTIF($A$3:$A${last_row-1}, A{r})>1, "❌ Multiple Suppliers", "")'
+                _data_style(ws_pv1.cell(row=r, column=3), align="center")
+            else:
+                current_supplier_cell = f"A{r}"
+                ws_pv1.cell(row=r, column=2).value = f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_supp_col_ltr}:${po_supp_col_ltr}, A{r})"
+                ws_pv1.cell(row=r, column=3).value = ""
+
     _auto_width(ws_pv1)
 
     # ── Sheet 4 : Pivot by FSN ──────────────────────────────────────────
     ws_pv2 = wb.create_sheet("Pivot – FSN")
+    formula_map_pv2 = {
+        "Total_Qty": f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_fsn_col}:${po_fsn_col}, {{FSN_cell}})"
+    }
     _write_df_to_sheet(
         ws_pv2, pv_fsn,
         title_row=f"Qty by FSN  |  {date_str}",
         total_last_row=True,
+        formula_map=formula_map_pv2
     )
-    ws_pv2.freeze_panes = "A3"
     _auto_width(ws_pv2)
 
     # ── Sheet 5 : Store Summary ──────────────────────────────────────────
@@ -827,12 +901,20 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
         _hdr_style(ws_stores.cell(row=2, column=col_idx, value=col_name))
     ws_stores.row_dimensions[2].height = 20
 
+    store_col_name = "Store ID" if "Store ID" in po_out_cols else "Store"
+    if store_col_name not in po_out_cols:
+        store_col_name = "Warehouse" # fallback
+    po_store_col = get_column_letter(po_out_cols.index(store_col_name) + 1)
+
     # Data rows from row 3
     for row_idx, row in enumerate(store_df.itertuples(index=False), start=3):
         is_alt = (row_idx % 2 == 0)
         for col_idx, value in enumerate(row, 1):
+            if store_df.columns[col_idx-1] == "Total Qty":
+                value = f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_store_col}:${po_store_col}, A{row_idx})"
+                
             cell = ws_stores.cell(row=row_idx, column=col_idx, value=value)
-            if isinstance(value, (int, float)):
+            if isinstance(value, (int, float)) or str(value).startswith("="):
                 _data_style(cell, bg=CLR["alt_row"] if is_alt else None, align="right", num_fmt="#,##0")
             else:
                 _data_style(cell, bg=CLR["alt_row"] if is_alt else None)
@@ -847,18 +929,49 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
                     align="right" if isinstance(totals[col_name], (int, float)) else "left",
                     num_fmt="#,##0" if isinstance(totals[col_name], (int, float)) else None)
 
-    ws_stores.freeze_panes = "A3"
     _auto_width(ws_stores)
+
+    # ── Write Store Comparison ───────────────────────────────────────────
+    ws_stores.cell(row=1, column=7, value="🟢 Added Since Yesterday").font = Font(bold=True, color="008000")
+    ws_stores.cell(row=1, column=8, value="🔴 Removed Since Yesterday").font = Font(bold=True, color="FF0000")
+    
+    if store_compare_status == "ok":
+        max_len = max(len(added_stores), len(removed_stores))
+        if max_len == 0:
+            ws_stores.cell(row=2, column=7, value="(No changes)").font = Font(italic=True, color="808080")
+        else:
+            for i in range(max_len):
+                r_comp = i + 2
+                if i < len(added_stores):
+                    ws_stores.cell(row=r_comp, column=7, value=added_stores[i])
+                if i < len(removed_stores):
+                    ws_stores.cell(row=r_comp, column=8, value=removed_stores[i])
+    else:
+        ws_stores.cell(row=2, column=7, value="(Yesterday's data unavailable)").font = Font(italic=True, color="808080")
+    
+    ws_stores.column_dimensions[get_column_letter(7)].width = 25
+    ws_stores.column_dimensions[get_column_letter(8)].width = 25
 
     if city_key in ["mumbai", "bengaluru"]:
         ws_eggs = wb.create_sheet("Eggs")
         egg_df = build_egg_pivot(po_df)
+        
+        wh_col_name = "Store Site ID" if "Store Site ID" in po_out_cols else "Warehouse"
+        title_col_name = "Title" if "Title" in po_out_cols else "FSN_Title"
+        
+        po_wh_col = get_column_letter(po_out_cols.index(wh_col_name) + 1)
+        po_title_col = get_column_letter(po_out_cols.index(title_col_name) + 1)
+        
+        formula_map_eggs = {
+            "Sum of QTY": f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_wh_col}:${po_wh_col}, {{Store Site ID_cell}}, 'PO'!${po_title_col}:${po_title_col}, {{Title_cell}})"
+        }
+        
         _write_df_to_sheet(
             ws_eggs, egg_df,
             title_row=f"Eggs  |  {date_str}",
             total_last_row=True,
+            formula_map=formula_map_eggs
         )
-        ws_eggs.freeze_panes = "A3"
         _auto_width(ws_eggs)
 
     # ── Sheet 6 : Mismatch Report ────────────────────────────────────────
