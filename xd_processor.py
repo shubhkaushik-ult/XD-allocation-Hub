@@ -35,6 +35,7 @@ from openpyxl.utils.dataframe import dataframe_to_rows
 
 # Service-account key shared across all cities
 SERVICE_ACCOUNT_KEY = "xd-allocation-9640b0ce66d2.json"
+MASTER_STORES_SHEET_ID = "14Lf3KRKWT6RJ-kct-VGfxOPjMkPqqr_pAM0UXqIzmPM"
 
 # Per-city config
 # tab_prefix : the letters before _YYYY-MM-DD_PO in the Google Sheet tab name
@@ -139,7 +140,18 @@ def fetch_indent_sheet(target_date: date, city_key: str) -> pd.DataFrame:
         )
         gc = gspread.authorize(creds)
         sh = gc.open_by_key(sheet_id)
-        ws = sh.worksheet(tab_name)
+        
+        try:
+            ws = sh.worksheet(tab_name)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = None
+            for sheet in sh.worksheets():
+                if sheet.title.startswith(tab_name):
+                    ws = sheet
+                    break
+            if not ws:
+                raise RuntimeError(f"Could not find any tab starting with '{tab_name}'")
+                
         all_values = ws.get_all_values()
         if all_values:
             headers = all_values[0]
@@ -306,6 +318,65 @@ def fetch_indent_plan(target_date: date, city_key: str):
     except Exception as e:
         print(f"[WARN] Could not fetch Indent Plan for {city_cfg['label']}: {e}")
         return None
+
+def fetch_master_stores(city_key: str) -> set:
+    """
+    Fetches the master list of stores from the configured Google Sheet.
+    Returns a set of store IDs/WH Codes.
+    """
+    initials_map = {
+        "bengaluru": "BLR",
+        "chennai": "CHN",
+        "mumbai": "MUM",
+        "trichy": "Trichy",
+        "coimbatore": "Coimbatore"
+    }
+    initials = initials_map.get(city_key, "UNK")
+    
+    try:
+        import gspread
+        from google.oauth2.service_account import Credentials
+        scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly", "https://www.googleapis.com/auth/drive.readonly"]
+        creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_KEY, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(MASTER_STORES_SHEET_ID)
+        
+        ws = None
+        target_name = f"{initials.lower()} fk customer"
+        for sheet in sh.worksheets():
+            if sheet.title.lower().startswith(target_name):
+                ws = sheet
+                break
+        
+        if not ws:
+            print(f"[WARN] No master store sheet found for '{initials} FK Customer'")
+            return set()
+            
+        all_values = ws.get_all_values()
+        if not all_values or len(all_values) < 2:
+            return set()
+            
+        headers = [h.strip().lower() for h in all_values[0]]
+        wh_idx = -1
+        for i, h in enumerate(headers):
+            if "wh code" in h or "nc customername" in h:
+                wh_idx = i
+                break
+                
+        if wh_idx == -1:
+            print(f"[WARN] WH Code / NC Customername column not found in master sheet.")
+            return set()
+            
+        stores = set()
+        for row in all_values[1:]:
+            if len(row) > wh_idx:
+                val = row[wh_idx].strip()
+                if val:
+                    stores.add(val)
+        return stores
+    except Exception as e:
+        print(f"[WARN] Failed to fetch master stores: {e}")
+        return set()
 
 def _sample_indent_data(target_date: date) -> pd.DataFrame:
     """Minimal offline sample – mirrors the structure of Trichy_Indent_sheet.xlsx."""
@@ -646,6 +717,24 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
 
     print(f"[{city_label}] [6/7] Building store summary ...")
     store_df, total_stores = build_store_summary(indent_df)
+    
+    # Merge master stores
+    master_stores = fetch_master_stores(city_key)
+    if master_stores:
+        active_stores = set(store_df["Store"]).union(set(store_df["Warehouse"]))
+        inactive_stores = master_stores - active_stores
+        if inactive_stores:
+            inactive_rows = []
+            for s in sorted(list(inactive_stores)):
+                inactive_rows.append({
+                    "Store": s, 
+                    "Warehouse": "", 
+                    "Verticals Served": "", 
+                    "FSN Count": 0, 
+                    "Total Qty": 0
+                })
+            inactive_df = pd.DataFrame(inactive_rows)
+            store_df = pd.concat([store_df, inactive_df], ignore_index=True)
 
     # Store comparison vs Yesterday
     try:
@@ -908,16 +997,22 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
 
     # Data rows from row 3
     for row_idx, row in enumerate(store_df.itertuples(index=False), start=3):
+        fsn_cnt = row[3]
+        tot_qty = row[4]
+        is_inactive = (fsn_cnt == 0 and tot_qty == 0)
         is_alt = (row_idx % 2 == 0)
+        
+        bg_color = "F2DCDB" if is_inactive else (CLR["alt_row"] if is_alt else None)
+        
         for col_idx, value in enumerate(row, 1):
-            if store_df.columns[col_idx-1] == "Total Qty":
+            if store_df.columns[col_idx-1] == "Total Qty" and not is_inactive:
                 value = f"=SUMIFS('PO'!${po_qty_col}:${po_qty_col}, 'PO'!${po_store_col}:${po_store_col}, A{row_idx})"
                 
             cell = ws_stores.cell(row=row_idx, column=col_idx, value=value)
             if isinstance(value, (int, float)) or str(value).startswith("="):
-                _data_style(cell, bg=CLR["alt_row"] if is_alt else None, align="right", num_fmt="#,##0")
+                _data_style(cell, bg=bg_color, align="right", num_fmt="#,##0")
             else:
-                _data_style(cell, bg=CLR["alt_row"] if is_alt else None)
+                _data_style(cell, bg=bg_color)
 
     # Grand total row
     total_row_s = 3 + len(store_df)
@@ -1362,6 +1457,8 @@ INDEX_HTML = """<!DOCTYPE html>
             </div>
         </div>
 
+
+
         <input type="hidden" id="selected-city" value="chennai">
 
         <button class="btn" id="btn-compile" onclick="compile()">
@@ -1502,8 +1599,17 @@ def create_app():
         delivery_date = target_date + timedelta(days=1)
         # Format month as short title-case name (e.g., Jun_27)
         delivery_str  = delivery_date.strftime('%b_%d')
+        del_date_str_gro_so = delivery_date.strftime("%d-%m-%Y")
 
         cities_to_run = list(CITIES.keys()) if city_key == "all" else [city_key]
+
+        gro_city_map = {
+            "bengaluru": "Bangalore",
+            "chennai": "Chennai",
+            "mumbai": "Mumbai",
+            "trichy": "Trichy",
+            "coimbatore": "Coimbatore"
+        }
 
         if len(cities_to_run) == 1:
             # ── Single city – return xlsx directly ──────────────────────
@@ -1524,7 +1630,7 @@ def create_app():
                 mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         else:
-            # ── All cities – return a ZIP containing all xlsx files ──────
+            # ── ZIP output (All cities OR Gro SO requested) ──────
             errors = {}
             zip_buf = io.BytesIO()
             with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -1535,12 +1641,15 @@ def create_app():
                     try:
                         run_city_report(target_date, opath, ck)
                         zf.write(opath, fname)
+
                     except Exception as e:
+                        import traceback
+                        traceback.print_exc()
                         errors[ck] = str(e)
             zip_buf.seek(0)
-            if errors and len(errors) == len(cities_to_run):
-                return jsonify({"error": "All cities failed", "details": errors}), 500
-            zip_name = f"XD_Allocation_All_{delivery_str}Delivery.zip"
+            if errors and len(errors) >= len(cities_to_run):
+                return jsonify({"error": "Failed to generate some or all reports", "details": errors}), 500
+            zip_name = f"XD_Allocation_{city_key}_{delivery_str}Delivery.zip"
             resp = send_file(
                 zip_buf,
                 as_attachment=True,
