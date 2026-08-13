@@ -29,10 +29,6 @@ from openpyxl.styles import (
 from openpyxl.utils import get_column_letter
 from openpyxl.utils.dataframe import dataframe_to_rows
 
-# ─────────────────────────────────────────────
-# CONFIG  – fill these in before running
-# ─────────────────────────────────────────────
-
 # Service-account key shared across all cities
 SERVICE_ACCOUNT_KEY = "xd-allocation-9640b0ce66d2.json"
 MASTER_STORES_SHEET_ID = "14Lf3KRKWT6RJ-kct-VGfxOPjMkPqqr_pAM0UXqIzmPM"
@@ -560,7 +556,7 @@ def build_store_summary(indent_df: pd.DataFrame) -> tuple:
         indent_df.groupby("Store", as_index=False)
         .agg(
             Warehouse=("Warehouse", "first"),
-            Verticals_Served=("VERTICAL", lambda x: ", ".join(sorted(x.unique()))),
+            Verticals_Served=("VERTICAL", lambda x: ", ".join(sorted(list(set([str(v).strip() for v in x.dropna().unique() if str(v).strip() != "" and str(v).lower() != "nan"]))))),
             FSN_Count=("FSN", "nunique"),
             Total_Qty=("Qty", "sum"),
         )
@@ -696,10 +692,242 @@ def _write_df_to_sheet(ws, df: pd.DataFrame, title_row: str = None,
 # ─────────────────────────────────────────────
 # MAIN REPORT BUILDER
 # ─────────────────────────────────────────────
-def build_excel_report(target_date: date, output_path: str, city_key: str = "trichy") -> str:
+def fetch_addon_metadata_from_db(fsn_list, city_id):
+    if not fsn_list:
+        return {}
+    
+    import json
+    import pymysql
+    import os
+    
+    cred_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "db_credentials.json")
+    try:
+        with open(cred_path, 'r') as f:
+            creds = json.load(f)
+    except Exception as e:
+        print(f"[WARN] Could not load db_credentials.json: {e}")
+        return {}
+        
+    fsn_format = ",".join(['%s'] * len(fsn_list))
+    query = f"""
+    SELECT peim.fsnCode, v.name AS vertical_name, peim.storage AS tag
+    FROM vormir.ProductExternalInternalMapping peim
+    JOIN asgard.Sku s ON s.Id = peim.skuId
+    JOIN cyclops.vertical v ON v.sub_category_classification_id = s.SubCategoryClassificationId
+    WHERE peim.fsnCode IN ({fsn_format})
+      AND peim.cityId = %s
+      AND s.CategoryId = 4
+    ORDER BY v.id DESC;
+    """
+    
+    params = list(fsn_list) + [city_id]
+    
+    results = {}
+    try:
+        conn = pymysql.connect(
+            host=creds.get('host'),
+            port=creds.get('port', 3306),
+            user=creds.get('user'),
+            password=creds.get('password'),
+            database=creds.get('database')
+        )
+        with conn.cursor(pymysql.cursors.DictCursor) as cur:
+            cur.execute(query, tuple(params))
+            rows = cur.fetchall()
+            for r in rows:
+                if r['fsnCode'] not in results:
+                    results[r['fsnCode']] = {
+                        'vertical': r['vertical_name'],
+                        'tag': str(r['tag']).strip().lower() if r['tag'] else "chiller"
+                    }
+        conn.close()
+    except Exception as e:
+        print(f"[WARN] DB query failed for addon items: {e}")
+        
+    return results
+
+
+def process_addon_df(addon_raw: pd.DataFrame, city_key: str) -> pd.DataFrame:
+    if addon_raw is None or addon_raw.empty:
+        return pd.DataFrame()
+        
+    df = addon_raw.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    
+    if "City" in df.columns and city_key != "all" and city_key in CITIES:
+        city_label = CITIES[city_key]["label"].lower()
+        city_aliases = {
+            "bengaluru": ["bengaluru", "bangalore", "blr", "ben"],
+            "chennai": ["chennai", "madras", "maa", "che"],
+            "mumbai": ["mumbai", "bombay", "bom", "mum"],
+            "trichy": ["trichy", "tiruchirappalli", "trz", "tri"],
+            "coimbatore": ["coimbatore", "cjb", "coi"]
+        }.get(city_key, [city_key, city_label])
+        df = df[df["City"].astype(str).str.strip().str.lower().isin(city_aliases)].copy()
+        
+    fsn_col = next((c for c in ["FSN", "fsn"] if c in df.columns), None)
+    if fsn_col:
+        df = df[df[fsn_col].astype(str).str.strip().str.lower().notna() & 
+                (df[fsn_col].astype(str).str.strip().str.lower() != "nan") & 
+                (df[fsn_col].astype(str).str.strip() != "")].copy()
+
+    if df.empty:
+        return pd.DataFrame()
+        
+    vertical_col = next((c for c in ["Vertical", "vertical", "VERTICAL", "L2", "l2"] if c in df.columns), None)
+    vertical_series = df[vertical_col].astype(str).str.strip() if vertical_col else None
+        
+    out = pd.DataFrame()
+    if "City" in df.columns:
+        out["City"] = df["City"].astype(str).str.strip()
+    else:
+        out["City"] = CITIES[city_key]["label"] if city_key in CITIES else ""
+        
+    wh_code_col = next((c for c in ["WH Code", "WH code", "wh code", "Store ID", "Store", "WH"] if c in df.columns), None)
+    store_id_series = df[wh_code_col].astype(str).str.strip() if wh_code_col else ""
+    out["Store ID"] = store_id_series
+    out["Store"] = store_id_series
+    
+    wh_name_col = next((c for c in ["Warehouse Name", "warehouse name", "WH Name", "Store Site ID", "Warehouse"] if c in df.columns), None)
+    site_id_series = df[wh_name_col].astype(str).str.strip() if wh_name_col else ""
+    out["Store Site ID"] = site_id_series
+    out["Warehouse"] = site_id_series
+    
+    out["FSN"] = df[fsn_col].astype(str).str.strip() if fsn_col else ""
+    
+    qty_col = next((c for c in ["Final PO", "final po", "PO qty", "Qty", "QTY", "Quantity"] if c in df.columns), None)
+    qty_series = pd.to_numeric(df[qty_col], errors="coerce").fillna(0) if qty_col else 0
+    out["Qty"] = qty_series
+    out["QTY"] = qty_series
+    out["PO qty"] = qty_series
+    
+    title_col = next((c for c in ["Title", "title", "FSN Title", "FSN_Title", "Name"] if c in df.columns), None)
+    title_series = df[title_col].astype(str).str.strip() if title_col else ""
+    out["Title"] = title_series
+    out["FSN_Title"] = title_series
+    
+    out["SLA"] = "7"
+    out["Brand"] = ""
+    
+    db_city_map = {
+        "bengaluru": 2,
+        "mumbai": 14,
+        "chennai": 3,
+        "hyderabad": 1,
+        "coimbatore": 7,
+        "trichy": 6
+    }
+    city_id = db_city_map.get(city_key, 2)
+    
+    unique_fsns = list(out["FSN"].unique())
+    unique_fsns = [f for f in unique_fsns if f.strip() != ""]
+    
+    metadata_map = fetch_addon_metadata_from_db(unique_fsns, city_id)
+    
+    out["VERTICAL"] = ""
+    out["Vertical"] = ""
+    out["tag"] = ""
+    
+    contract_col = next((c for c in ["Contract", "Contract ID"] if c in df.columns), None)
+    out["Contract ID"] = df[contract_col].astype(str).str.strip() if contract_col else ""
+    out["Contract"] = df[contract_col].astype(str).str.strip() if contract_col else ""
+    
+    supplier_col = next((c for c in ["OUID", "Supplier ID"] if c in df.columns), None)
+    out["Supplier ID"] = df[supplier_col].astype(str).str.strip() if supplier_col else ""
+
+    out["Chiller/Non chiller Tag"] = ""
+
+    for idx, row in out.iterrows():
+        fsn = row["FSN"].strip()
+        m = metadata_map.get(fsn, {})
+        
+        raw_vertical = ""
+        if vertical_series is not None:
+            raw_vertical = vertical_series.get(idx, "")
+            if pd.isna(raw_vertical) or str(raw_vertical).strip().lower() == "nan":
+                raw_vertical = ""
+                
+        vertical = raw_vertical or m.get("vertical", "Juice")
+        tag = m.get("tag", "chiller")
+        
+        out.at[idx, "VERTICAL"] = vertical
+        out.at[idx, "Vertical"] = vertical
+        out.at[idx, "tag"] = tag
+        out.at[idx, "Chiller/Non chiller Tag"] = tag
+        
+        is_ambient = "amb" in tag
+        if city_key == "mumbai":
+            out.at[idx, "Contract ID"] = "SHR-OR-01062967"
+            out.at[idx, "Contract"] = "SHR-OR-01062967"
+            if is_ambient:
+                out.at[idx, "Supplier ID"] = "OU49532875"
+            else:
+                out.at[idx, "Supplier ID"] = "OU42311586"
+        elif city_key == "chennai":
+            out.at[idx, "Contract ID"] = "SHR-OR-01021287"
+            out.at[idx, "Contract"] = "SHR-OR-01021287"
+            out.at[idx, "Supplier ID"] = "OU56307764"
+        else:
+            out.at[idx, "Contract ID"] = "SHR-OR-01021287"
+            out.at[idx, "Contract"] = "SHR-OR-01021287"
+            if is_ambient:
+                out.at[idx, "Supplier ID"] = "OU83946715"
+            else:
+                out.at[idx, "Supplier ID"] = "OU77187305"
+        
+    if "OUID" in df.columns:
+        out["OUID"] = df["OUID"].astype(str).str.strip()
+    if "Po No" in df.columns:
+        out["Po No"] = df["Po No"].astype(str).str.strip()
+    else:
+        out["Po No"] = ""
+        
+    return out
+
+
+def _coalesce_col(df: pd.DataFrame, target_col: str, source_cols: list, default_val: str = "") -> pd.DataFrame:
+    import numpy as np
+    s = df[target_col].copy() if target_col in df.columns else pd.Series(index=df.index, dtype=object)
+    s = s.replace("", np.nan)
+    for c in source_cols:
+        if c in df.columns:
+            s = s.fillna(df[c].replace("", np.nan))
+    if default_val != "":
+        s = s.fillna(default_val)
+    df[target_col] = s.fillna("")
+    return df
+
+
+def build_excel_report(target_date: date, output_path: str, city_key: str = "trichy", addon_df: pd.DataFrame = None) -> str:
     city_label = CITIES[city_key]["label"]
     print(f"[{city_label}] [1/7] Fetching Indent sheet for {target_date} ...")
     indent_df = fetch_indent_sheet(target_date, city_key)
+
+    if addon_df is not None:
+        addon_processed = pd.DataFrame()
+        if isinstance(addon_df, list):
+            processed_list = [process_addon_df(df, city_key) for df in addon_df if df is not None and not df.empty]
+            processed_list = [df for df in processed_list if not df.empty]
+            if processed_list:
+                addon_processed = pd.concat(processed_list, ignore_index=True)
+        elif not addon_df.empty:
+            addon_processed = process_addon_df(addon_df, city_key)
+            
+        if not addon_processed.empty:
+            print(f"[{city_label}] Merging {len(addon_processed)} Add-on rows into Indent data ...")
+            indent_df = pd.concat([indent_df, addon_processed], ignore_index=True)
+
+    indent_df = _coalesce_col(indent_df, "VERTICAL", ["Vertical", "VERTICAL"])
+    indent_df = _coalesce_col(indent_df, "Vertical", ["VERTICAL", "Vertical"])
+    indent_df = _coalesce_col(indent_df, "FSN_Title", ["Title", "FSN_Title"])
+    indent_df = _coalesce_col(indent_df, "Title", ["FSN_Title", "Title"])
+    indent_df = _coalesce_col(indent_df, "Store", ["Store ID", "Store"])
+    indent_df = _coalesce_col(indent_df, "Store ID", ["Store", "Store ID"])
+    indent_df = _coalesce_col(indent_df, "Warehouse", ["Store Site ID", "Warehouse"])
+    indent_df = _coalesce_col(indent_df, "Store Site ID", ["Warehouse", "Store Site ID"])
+    indent_df = _coalesce_col(indent_df, "Qty", ["QTY", "PO qty", "Qty"])
+    indent_df["Qty"] = pd.to_numeric(indent_df["Qty"], errors="coerce").fillna(0)
+    indent_df["QTY"] = indent_df["Qty"]
 
     print(f"[{city_label}] [2/7] Building PO sheet ...")
     po_df = build_po_sheet(indent_df, target_date, city_key)
@@ -766,34 +994,23 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
     supp_col = "Supplier ID" if "Supplier ID" in po_out.columns else "SLA"
     
     if city_key in ["bengaluru", "mumbai"]:
-        po_out["City"] = po_out.get("City", "Bengaluru" if city_key == "bengaluru" else "Mumbai")
-        po_out["Store ID"] = po_out.get("Store", "")
-        po_out["Store Site ID"] = po_out.get("Warehouse", po_out.get("Store Site ID", ""))
-        po_out["QTY"] = po_out.get("Qty", "")
-        po_out["SLA"] = po_out.get("SLA", po_out.get(supp_col, ""))
-        po_out["Supplier ID"] = po_out.get("Supplier ID", po_out.get(supp_col, ""))
-        po_out["Contract ID"] = po_out.get("Contract ID", "")
-        po_out["Po No"] = po_out.get("Po No", "")
-        po_out["Title"] = po_out.get("Title", po_out.get("FSN_Title", ""))
-        po_out["Brand"] = po_out.get("Brand", "")
-        
-        # Ensure we properly fallback without NaNs overwriting
-        vert_series = po_out.get("Vertical")
-        if vert_series is None or vert_series.isna().all():
-            vert_series = po_out.get("VERTICAL", "")
-        po_out["Vertical"] = vert_series
+        po_out = _coalesce_col(po_out, "City", ["City"], default_val="Bengaluru" if city_key == "bengaluru" else "Mumbai")
+        po_out = _coalesce_col(po_out, "Store ID", ["Store ID", "Store"])
+        po_out = _coalesce_col(po_out, "Store Site ID", ["Store Site ID", "Warehouse"])
+        po_out = _coalesce_col(po_out, "QTY", ["QTY", "Qty", "PO qty"])
+        po_out = _coalesce_col(po_out, "SLA", ["SLA", supp_col])
+        po_out = _coalesce_col(po_out, "Supplier ID", ["Supplier ID", supp_col, "SLA"])
+        po_out = _coalesce_col(po_out, "Contract ID", ["Contract ID", "Contract"])
+        po_out = _coalesce_col(po_out, "Po No", ["Po No"])
+        po_out = _coalesce_col(po_out, "Title", ["Title", "FSN_Title"])
+        po_out = _coalesce_col(po_out, "Brand", ["Brand"])
+        po_out = _coalesce_col(po_out, "Vertical", ["Vertical", "VERTICAL"])
         
         if city_key == "mumbai":
-            tag_series = po_out.get("tag")
-            if tag_series is None or tag_series.isna().all():
-                tag_series = po_out.get("Chiller/Non chiller Tag", "")
-            po_out["tag"] = tag_series
+            po_out = _coalesce_col(po_out, "tag", ["tag", "Chiller/Non chiller Tag"])
             out_cols = ["City", "Store ID", "Store Site ID", "FSN", "QTY", "SLA", "Supplier ID", "Contract ID", "Po No", "Title", "Brand", "Vertical", "tag"]
         else: # bengaluru
-            tag_series = po_out.get("Chiller/Non chiller Tag")
-            if tag_series is None or tag_series.isna().all():
-                tag_series = po_out.get("tag", "")
-            po_out["Chiller/Non chiller Tag"] = tag_series
+            po_out = _coalesce_col(po_out, "Chiller/Non chiller Tag", ["Chiller/Non chiller Tag", "tag"])
             out_cols = ["City", "Store ID", "Store Site ID", "FSN", "QTY", "SLA", "Supplier ID", "Contract ID", "Po No", "Title", "Brand", "Vertical", "Chiller/Non chiller Tag"]
             
         for c in out_cols:
@@ -804,23 +1021,21 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
         po_out = po_out.sort_values(["Vertical", "FSN", "Store ID"]).reset_index(drop=True)
     else:
         po_out["Date"] = target_date.strftime("%d-%b-%Y") if target_date else ""
-        po_out["Contract ID"] = po_out.get("Contract ID", "")
-        po_out["Warehouse"] = po_out.get("Warehouse", "")
-        
-        po_out = po_out.rename(columns={
-            "FSN_Title": "Title",
-            "Qty": "PO qty",
-            "VERTICAL": "Vertical",
-            supp_col: "Supplier ID",
-            "Store": "Store ID",
-        })
+        po_out = _coalesce_col(po_out, "Contract ID", ["Contract ID", "Contract"])
+        po_out = _coalesce_col(po_out, "Warehouse", ["Warehouse", "Store Site ID"])
+        po_out = _coalesce_col(po_out, "Title", ["Title", "FSN_Title"])
+        po_out = _coalesce_col(po_out, "PO qty", ["PO qty", "QTY", "Qty"])
+        po_out = _coalesce_col(po_out, "Vertical", ["Vertical", "VERTICAL"])
+        po_out = _coalesce_col(po_out, "Supplier ID", ["Supplier ID", supp_col, "SLA"])
+        po_out = _coalesce_col(po_out, "Store ID", ["Store ID", "Store"])
+        po_out = _coalesce_col(po_out, "Brand", ["Brand"])
         
         out_cols = ["Date", "Brand", "Title", "FSN", "PO qty", "Vertical", "Supplier ID", "Contract ID", "Store ID", "Warehouse"]
         for c in out_cols:
             if c not in po_out.columns:
                 po_out[c] = ""
                 
-        po_out = po_out[out_cols]
+        po_out = po_out[out_cols].fillna("")
         po_out = po_out.sort_values(["Vertical", "FSN", "Warehouse"]).reset_index(drop=True)
         
     _write_df_to_sheet(ws_po, po_out)
@@ -1096,11 +1311,11 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
 # ─────────────────────────────────────────────
 # DELEGATION WRAPPER
 # ─────────────────────────────────────────────
-def run_city_report(target_date: date, output_path: str, city_key: str) -> str:
+def run_city_report(target_date: date, output_path: str, city_key: str, addon_df: pd.DataFrame = None) -> str:
     """
     Builds the report for all configured cities using the unified build_excel_report logic.
     """
-    return build_excel_report(target_date, output_path, city_key)
+    return build_excel_report(target_date, output_path, city_key, addon_df=addon_df)
 
 
 # ─────────────────────────────────────────────
@@ -1122,7 +1337,7 @@ INDEX_HTML = """<!DOCTYPE html>
             color: #111827;
             min-height: 100vh;
             display: flex;
-            align-items: center;
+            align-items: center ;
             justify-content: center;
             padding: 1.5rem;
         }
@@ -1459,6 +1674,16 @@ INDEX_HTML = """<!DOCTYPE html>
 
 
 
+        <!-- Add-on Panel -->
+        <div class="panel" style="margin-top: 1rem;">
+            <div class="panel-label">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+                Extra Add-ons / Pluckk Data File (Optional)
+            </div>
+            <input type="file" id="addon-file" accept=".xlsx,.xls,.csv" multiple style="width:100%; padding:0.6rem; border:1px solid #e5e7eb; border-radius:0.5rem; background:#f9fafb; font-size:0.85rem; cursor:pointer;">
+            <div style="font-size:0.75rem; color:#6b7280; margin-top:0.3rem;">Upload the add-on Excel/CSV file (e.g. Pluckk sheet) to automatically merge into the allocation and calculations.</div>
+        </div>
+
         <input type="hidden" id="selected-city" value="chennai">
 
         <button class="btn" id="btn-compile" onclick="compile()">
@@ -1492,6 +1717,7 @@ INDEX_HTML = """<!DOCTYPE html>
         async function compile() {
             const date = dp.value;
             const city = document.getElementById('selected-city').value;
+            const addonInput = document.getElementById('addon-file');
             const btn  = document.getElementById('btn-compile');
             const icon = document.getElementById('btn-icon');
             const spin = document.getElementById('btn-spinner');
@@ -1504,11 +1730,19 @@ INDEX_HTML = """<!DOCTYPE html>
             spin.style.display = 'block';
             lbl.textContent = 'Processing...';
 
+            const formData = new FormData();
+            formData.append('date', date);
+            formData.append('city', city);
+            if (addonInput && addonInput.files && addonInput.files.length > 0) {
+                for (let i = 0; i < addonInput.files.length; i++) {
+                    formData.append('addon_file', addonInput.files[i]);
+                }
+            }
+
             try {
                 const res = await fetch('/process', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ date, city })
+                    body: formData
                 });
 
                 if (!res.ok) {
@@ -1581,9 +1815,31 @@ def create_app():
 
     @app.route("/process", methods=["POST"])
     def process():
-        body = request.get_json(force=True, silent=True) or {}
-        date_str = body.get("date") or request.args.get("date")
-        city_key = (body.get("city") or request.args.get("city", "all")).lower()
+        if request.files or (request.content_type and "multipart/form-data" in request.content_type):
+            date_str = request.form.get("date") or request.args.get("date")
+            city_key = (request.form.get("city") or request.args.get("city", "all")).lower()
+            addon_files = request.files.getlist("addon_file")
+        else:
+            body = request.get_json(force=True, silent=True) or {}
+            date_str = body.get("date") or request.args.get("date")
+            city_key = (body.get("city") or request.args.get("city", "all")).lower()
+            addon_files = []
+
+        addon_df = None
+        if addon_files:
+            addon_df = []
+            for addon_file in addon_files:
+                if addon_file and addon_file.filename:
+                    try:
+                        if addon_file.filename.lower().endswith(".csv"):
+                            addon_df.append(pd.read_csv(addon_file))
+                        else:
+                            sheets = pd.read_excel(addon_file, sheet_name=None)
+                            addon_df.extend(list(sheets.values()))
+                    except Exception as e:
+                        return jsonify({"error": f"Failed to read addon_file {addon_file.filename}: {e}"}), 400
+            if not addon_df:
+                addon_df = None
 
         if not date_str:
             return jsonify({"error": "Missing 'date' field. Send { \"date\": \"YYYY-MM-DD\" }"}), 400
@@ -1618,7 +1874,7 @@ def create_app():
             fname = f"{label}_XD_Allocation_{delivery_str}_Delivery.xlsx"
             opath = os.path.join(OUTPUT_DIR, fname)
             try:
-                run_city_report(target_date, opath, ck)
+                run_city_report(target_date, opath, ck, addon_df=addon_df)
             except Exception as e:
                 import traceback
                 traceback.print_exc()
@@ -1639,7 +1895,7 @@ def create_app():
                     fname = f"{label}_XD_Allocation_{delivery_str}_Delivery.xlsx"
                     opath = os.path.join(OUTPUT_DIR, fname)
                     try:
-                        run_city_report(target_date, opath, ck)
+                        run_city_report(target_date, opath, ck, addon_df=addon_df)
                         zf.write(opath, fname)
 
                     except Exception as e:
@@ -1680,6 +1936,7 @@ if __name__ == "__main__":
         help="City to process (default: all)",
     )
     run_parser.add_argument("--out", default=None, help="Output file path (only used when --city is a single city)")
+    run_parser.add_argument("--addon-file", default=None, help="Path to Add-on Excel/CSV file to merge into allocation")
 
     # run as Flask server
     serve_parser = subparsers.add_parser("serve", help="Start Flask API server")
@@ -1693,6 +1950,14 @@ if __name__ == "__main__":
         delivery_str  = delivery_date.strftime('%b_%d')
 
         cities_to_run = list(CITIES.keys()) if args.city == "all" else [args.city]
+        
+        addon_df = None
+        if args.addon_file and os.path.exists(args.addon_file):
+            if args.addon_file.lower().endswith(".csv"):
+                addon_df = [pd.read_csv(args.addon_file)]
+            else:
+                sheets = pd.read_excel(args.addon_file, sheet_name=None)
+                addon_df = list(sheets.values())
 
         for city_key in cities_to_run:
             label = CITIES[city_key]["label"]
@@ -1701,7 +1966,7 @@ if __name__ == "__main__":
             else:
                 out = os.path.join(OUTPUT_DIR, f"{label}_XD_Allocation_{delivery_str}_Delivery.xlsx")
             try:
-                run_city_report(target_date, out, city_key)
+                run_city_report(target_date, out, city_key, addon_df=addon_df)
             except RuntimeError as e:
                 print(f"[SKIP] {label}: {e}")
 
