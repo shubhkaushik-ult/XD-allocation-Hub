@@ -99,6 +99,111 @@ else:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # ─────────────────────────────────────────────
+# CUSTOM SERVER ERROR EXCEPTIONS & SAFEGUARDS
+# ─────────────────────────────────────────────
+class ServerProcessingError(Exception):
+    """Base class for critical server processing errors."""
+    def __init__(self, message: str, error_type: str = "SERVER_ERROR", details: dict = None, status_code: int = 500):
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type
+        self.details = details or {}
+        self.status_code = status_code
+
+
+class HeaderMismatchError(ServerProcessingError):
+    """Raised when uploaded files miss required semantic headers."""
+    def __init__(self, message: str, details: dict = None):
+        super().__init__(message, error_type="HEADER_MISMATCH", details=details, status_code=500)
+
+
+class QuantityMismatchError(ServerProcessingError):
+    """Raised when total input indent qty does not match output PO qty."""
+    def __init__(self, message: str, details: dict = None):
+        super().__init__(message, error_type="QUANTITY_MISMATCH", details=details, status_code=500)
+
+
+class ProcessingTimeoutError(ServerProcessingError):
+    """Raised when an operation exceeds maximum execution time limit."""
+    def __init__(self, message: str, details: dict = None):
+        super().__init__(message, error_type="TIMEOUT_ERROR", details=details, status_code=504)
+
+
+class DataIntegrityError(ServerProcessingError):
+    """Raised on zero rows, unresolvable store/warehouse mapping, or data corruption."""
+    def __init__(self, message: str, details: dict = None):
+        super().__init__(message, error_type="DATA_INTEGRITY_ERROR", details=details, status_code=500)
+
+
+class TimeoutWatchdog:
+    """Monitors execution time to prevent silent Vercel function timeouts."""
+    def __init__(self, max_seconds: float = 50.0, operation_name: str = "Report Processing"):
+        import time
+        self.start_time = time.time()
+        self.max_seconds = max_seconds
+        self.operation_name = operation_name
+
+    def check(self, step_name: str = ""):
+        import time
+        elapsed = time.time() - self.start_time
+        if elapsed > self.max_seconds:
+            raise ProcessingTimeoutError(
+                f"Timeout Error: {self.operation_name} exceeded max execution duration ({round(elapsed, 1)}s > {self.max_seconds}s) at step '{step_name}'.",
+                details={
+                    "operation": self.operation_name,
+                    "step": step_name,
+                    "elapsed_seconds": round(elapsed, 2),
+                    "max_seconds": self.max_seconds
+                }
+            )
+
+
+def validate_uploaded_headers(df: pd.DataFrame, file_type: str = "raw_indent", filename: str = "uploaded_file") -> None:
+    """
+    Validates that essential semantic columns exist in the uploaded DataFrame.
+    Throws HeaderMismatchError if mandatory columns are missing.
+    """
+    if df is None or df.empty:
+        raise HeaderMismatchError(
+            f"Header Mismatch: Uploaded {file_type} file '{filename}' is empty or has no rows.",
+            details={"file_type": file_type, "filename": filename, "row_count": 0}
+        )
+    
+    cols = [str(c).strip() for c in df.columns]
+    cols_lower = [c.lower() for c in cols]
+    
+    # 1. FSN / SKU column check
+    fsn_candidates = ["fsn", "fsn code", "item code", "sku", "item_code", "fsn_code", "product_code"]
+    has_fsn = any(cand in cols_lower for cand in fsn_candidates)
+    
+    # 2. Quantity column check
+    qty_candidates = ["qty", "quantity", "final po", "po qty", "final_quantity", "final quantity", "indent qty", "final_qty", "req_qty", "allocated_qty"]
+    has_qty = any(any(cand in c for cand in qty_candidates) for c in cols_lower)
+    
+    # 3. Store / Warehouse / Location check (for raw indents and add-ons)
+    loc_candidates = ["store", "store id", "fc", "wh code", "wh", "store id/wh code", "warehouse", "store site id", "location", "hub", "ds"]
+    has_loc = any(cand in cols_lower for cand in loc_candidates)
+    
+    missing = []
+    if not has_fsn:
+        missing.append("FSN / Item Code (e.g. 'FSN', 'SKU')")
+    if not has_qty:
+        missing.append("Quantity (e.g. 'Qty', 'PO qty', 'Final_Quantity', 'Final PO')")
+    if not has_loc and file_type != "staples":
+        missing.append("Store / FC / Warehouse Code (e.g. 'Store ID', 'Store', 'fc', 'WH Code')")
+        
+    if missing:
+        raise HeaderMismatchError(
+            f"Header Mismatch in {file_type} file '{filename}': Missing mandatory column(s): {', '.join(missing)}. Available columns: {cols}",
+            details={
+                "file_type": file_type,
+                "filename": filename,
+                "missing_columns": missing,
+                "found_columns": cols
+            }
+        )
+
+# ─────────────────────────────────────────────
 # COLOURS
 # ─────────────────────────────────────────────
 CLR = {
@@ -252,6 +357,7 @@ def prepare_raw_indent_df(raw_indent_df: pd.DataFrame) -> pd.DataFrame:
     if raw_indent_df is None or raw_indent_df.empty:
         return raw_indent_df
 
+    validate_uploaded_headers(raw_indent_df, file_type="raw_indent", filename="raw_indent_file")
     raw_indent_df = raw_indent_df.copy()
     raw_indent_df.columns = [str(c).strip() for c in raw_indent_df.columns]
 
@@ -867,6 +973,7 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
     if addon_raw is None or addon_raw.empty:
         return pd.DataFrame()
         
+    validate_uploaded_headers(addon_raw, file_type="staples" if is_staples else "addon", filename=f"{city_key}_{'staples' if is_staples else 'addon'}")
     df = addon_raw.copy()
     df.columns = [str(c).strip() for c in df.columns]
     
@@ -1070,14 +1177,26 @@ def filter_raw_indent_by_city(raw_indent_df: pd.DataFrame, city_key: str, city_l
                 indent_df = filtered_df
                 print(f"[{city_label}] Filtered {len(indent_df)} rows for {city_label} using column '{city_col}'.")
             else:
-                print(f"[{city_label}] Warning: 0 rows found in uploaded sheet using '{city_col}' filter for aliases {city_aliases}.")
-                indent_df = pd.DataFrame()
+                found_unique_cities = list(raw_indent_df[city_col].astype(str).unique())[:10]
+                raise DataIntegrityError(
+                    f"Data Integrity Error: 0 rows found in uploaded sheet for {city_label} using column '{city_col}' with aliases {city_aliases}. Found cities in file: {found_unique_cities}",
+                    details={
+                        "city": city_key,
+                        "city_label": city_label,
+                        "filter_column": city_col,
+                        "expected_aliases": city_aliases,
+                        "found_cities_in_file": found_unique_cities
+                    }
+                )
         else:
             print(f"[{city_label}] Info: No city column found in raw data. Using all {len(indent_df)} rows.")
     return indent_df
 
 def build_excel_report(target_date: date, output_path: str, city_key: str = "trichy", addon_df: pd.DataFrame = None, staples_df: pd.DataFrame = None, raw_indent_df: pd.DataFrame = None) -> str:
     city_label = CITIES[city_key]["label"]
+    watchdog = TimeoutWatchdog(max_seconds=50.0, operation_name=f"Report Generation for {city_label}")
+    watchdog.check("Start")
+
     # Primary source for all cities: uploaded raw allocation file
     if raw_indent_df is not None and not raw_indent_df.empty:
         print(f"[{city_label}] [1/7] Using uploaded raw allocation file for {city_label}...")
@@ -1118,6 +1237,9 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
     indent_df["Qty"] = pd.to_numeric(indent_df["Qty"], errors="coerce").fillna(0)
     indent_df["QTY"] = indent_df["Qty"]
 
+    # Calculate input raw quantity baseline for verification
+    raw_input_qty = float(indent_df["Qty"].sum()) if not indent_df.empty else 0.0
+
     # 2. Merge Add-on & Staples data cleanly if provided
     addon_dfs_list = []
     if addon_df is not None:
@@ -1139,6 +1261,7 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
 
     addon_processed = pd.DataFrame()
     processed_list = [df for df in addon_processed_list if not df.empty]
+    addon_input_qty = 0.0
     if processed_list:
         addon_processed = pd.concat(processed_list, ignore_index=True)
             
@@ -1173,6 +1296,7 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
             addon_processed = addon_processed.groupby(["_store_norm", "_fsn_norm"], as_index=False).agg(agg_map)
             addon_processed["QTY"] = addon_processed["Qty"]
             addon_processed["PO qty"] = addon_processed["Qty"]
+            addon_input_qty = float(addon_processed["Qty"].sum())
 
             # Clean up helper columns
             for col in ["_store_norm", "_fsn_norm"]:
@@ -1198,17 +1322,45 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
     indent_df["QTY"] = indent_df["Qty"]
     indent_df["PO qty"] = indent_df["Qty"]
 
+    # Verify input data is not completely empty
+    if indent_df.empty:
+        raise DataIntegrityError(
+            f"Data Integrity Error: No valid non-zero allocation rows found for {city_label}.",
+            details={"city": city_key, "city_label": city_label, "raw_rows": len(raw_indent_df) if raw_indent_df is not None else 0}
+        )
+
+    watchdog.check("Building PO sheet")
     print(f"[{city_label}] [2/7] Building PO sheet ...")
     po_df = build_po_sheet(indent_df, target_date, city_key)
 
+    # QUANTITY RECONCILIATION INTEGRITY CHECK
+    expected_total_qty = round(raw_input_qty + addon_input_qty, 3)
+    actual_output_po_qty = round(float(po_df["Qty"].sum()), 3) if not po_df.empty else 0.0
+    
+    if abs(expected_total_qty - actual_output_po_qty) > 0.001:
+        discrepancy = round(actual_output_po_qty - expected_total_qty, 3)
+        raise QuantityMismatchError(
+            f"Quantity Mismatch for {city_label}: Total input indent quantity ({expected_total_qty}) does not match final output PO quantity ({actual_output_po_qty}). Discrepancy: {discrepancy} units.",
+            details={
+                "city": city_key,
+                "city_label": city_label,
+                "expected_input_qty": expected_total_qty,
+                "actual_output_po_qty": actual_output_po_qty,
+                "discrepancy": discrepancy
+            }
+        )
+
+    watchdog.check("Building Indent summary")
     print(f"[{city_label}] [3/7] Building Indent summary (VLOOKUP + cross-verify) ...")
     plan_df = fetch_indent_plan(target_date, city_key)
     indent_summary = build_indent_summary(indent_df, plan_df, target_date)
 
+    watchdog.check("Building pivot tables")
     print(f"[{city_label}] [4/7] Building pivot tables ...")
     pv_vertical = build_pivot_vertical(indent_df, city_key)
     pv_fsn      = build_pivot_fsn(indent_df)
 
+    watchdog.check("Building mismatch report")
     print(f"[{city_label}] [5/7] Building mismatch report ...")
     mismatches  = build_mismatch_report(indent_summary)
 
@@ -2359,6 +2511,49 @@ def create_app():
         except Exception as e:
             return jsonify({"jsonrpc": "2.0", "id": None, "error": {"code": -32603, "message": str(e)}}), 500
 
+    def format_server_error_response(exc: Exception, city_key: str = "global"):
+        error_type = getattr(exc, "error_type", exc.__class__.__name__)
+        status_code = getattr(exc, "status_code", 500)
+        details = getattr(exc, "details", {})
+        error_msg = str(exc)
+        
+        # Look up KB fix from UniOps
+        suggested_fix = None
+        if uniops_instance:
+            try:
+                from datetime import timezone
+                kb_item = uniops_instance.find_kb_fix(error_msg, project="xd_allocation")
+                if kb_item:
+                    suggested_fix = kb_item.get("remediation_steps")
+                # Log error event to uniops_events.jsonl
+                uniops_instance.log(
+                    level="ERROR",
+                    project="xd_allocation",
+                    message=f"[{error_type}] {error_msg}",
+                    details={"details": details, "city": city_key},
+                    event_type=error_type
+                )
+            except Exception:
+                pass
+                
+        from datetime import timezone
+        return jsonify({
+            "status": "error",
+            "error_type": error_type,
+            "error": error_msg,
+            "details": details,
+            "suggested_fix": suggested_fix or "Verify file formatting, city selection, and column headers, then retry.",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }), status_code
+
+    @app.errorhandler(ServerProcessingError)
+    def handle_custom_server_error(e):
+        return format_server_error_response(e)
+
+    @app.errorhandler(500)
+    def handle_500_error(e):
+        return format_server_error_response(e)
+
     @app.route("/process", methods=["POST"])
     def process():
         if request.files or (request.content_type and "multipart/form-data" in request.content_type):
@@ -2382,7 +2577,7 @@ def create_app():
                 if dfs:
                     raw_indent_df = prepare_raw_indent_df(dfs[0])
             except Exception as e:
-                return jsonify({"error": f"Failed to read raw_indent_file {raw_indent_file.filename}: {e}"}), 400
+                return format_server_error_response(e, city_key)
 
         addon_df = None
         if addon_files:
@@ -2394,7 +2589,7 @@ def create_app():
                         if dfs:
                             addon_df.extend(dfs)
                     except Exception as e:
-                        return jsonify({"error": f"Failed to read addon_file {addon_file.filename}: {e}"}), 400
+                        return format_server_error_response(e, city_key)
             if not addon_df:
                 addon_df = None
 
@@ -2408,12 +2603,12 @@ def create_app():
                         if dfs:
                             staples_df.extend(dfs)
                     except Exception as e:
-                        return jsonify({"error": f"Failed to read staples_file {st_file.filename}: {e}"}), 400
+                        return format_server_error_response(e, city_key)
             if not staples_df:
                 staples_df = None
 
         if not date_str:
-            return jsonify({"error": "Missing 'date' field. Send { \"date\": \"YYYY-MM-DD\" }"}), 400
+            return jsonify({"status": "error", "error_type": "INVALID_INPUT", "error": "Missing 'date' field. Send { \"date\": \"YYYY-MM-DD\" }"}), 400
 
         city_form_list = request.form.getlist("cities") or request.form.getlist("city")
         if city_form_list and len(city_form_list) > 1:
@@ -2428,25 +2623,17 @@ def create_app():
             cities_to_run = [c for c in raw_cities if c in CITIES]
 
         if not cities_to_run:
-            return jsonify({"error": f"No valid cities selected. Valid options: {list(CITIES.keys())} or 'all'"}), 400
+            return jsonify({"status": "error", "error_type": "INVALID_INPUT", "error": f"No valid cities selected. Valid options: {list(CITIES.keys())} or 'all'"}), 400
 
         try:
             target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
-            return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+            return jsonify({"status": "error", "error_type": "INVALID_INPUT", "error": "Invalid date format. Use YYYY-MM-DD"}), 400
 
         delivery_date = target_date + timedelta(days=1)
         # Format month as short title-case name (e.g., Jun_27)
         delivery_str  = delivery_date.strftime('%b_%d')
         del_date_str_gro_so = delivery_date.strftime("%d-%m-%Y")
-
-        gro_city_map = {
-            "bengaluru": "Bangalore",
-            "chennai": "Chennai",
-            "mumbai": "Mumbai",
-            "trichy": "Trichy",
-            "coimbatore": "Coimbatore"
-        }
 
         if len(cities_to_run) == 1:
             # ── Single city – return xlsx directly ──────────────────────
@@ -2459,7 +2646,7 @@ def create_app():
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                return jsonify({"error": str(e)}), 500
+                return format_server_error_response(e, ck)
             return send_file(
                 opath,
                 as_attachment=True,
@@ -2478,24 +2665,31 @@ def create_app():
                     try:
                         run_city_report(target_date, opath, ck, addon_df=addon_df, staples_df=staples_df, raw_indent_df=raw_indent_df)
                         zf.write(opath, fname)
-
                     except Exception as e:
                         import traceback
                         traceback.print_exc()
-                        errors[ck] = str(e)
+                        errors[ck] = {
+                            "error": str(e),
+                            "error_type": getattr(e, "error_type", e.__class__.__name__),
+                            "details": getattr(e, "details", {})
+                        }
             zip_buf.seek(0)
-            if errors and len(errors) >= len(cities_to_run):
-                return jsonify({"error": "Failed to generate some or all reports", "details": errors}), 500
+            if errors:
+                from datetime import timezone
+                return jsonify({
+                    "status": "error",
+                    "error_type": "MULTI_CITY_PROCESSING_ERROR",
+                    "error": f"Failed to generate reports for: {list(errors.keys())}",
+                    "details": errors,
+                    "timestamp": datetime.now(timezone.utc).isoformat()
+                }), 500
             zip_name = f"XD_Allocation_{city_key}_{delivery_str}Delivery.zip"
-            resp = send_file(
+            return send_file(
                 zip_buf,
                 as_attachment=True,
                 download_name=zip_name,
                 mimetype="application/zip",
             )
-            if errors:
-                resp.headers["X-Partial-Errors"] = json.dumps(errors)
-            return resp
 
     return app
 
