@@ -650,6 +650,8 @@ def normalize_vertical(val: str) -> str:
     if not s or s.lower() in ("nan", "none", "null"):
         return ""
     s_lower = s.lower()
+    if "egg" in s_lower or "anda" in s_lower:
+        return "Eggs"
     vertical_map = {
         "egg": "Eggs",
         "eggs": "Eggs",
@@ -871,11 +873,12 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
     if "City" in df.columns and city_key != "all" and city_key in CITIES:
         city_label = CITIES[city_key]["label"].lower()
         city_aliases = {
-            "bengaluru": ["bengaluru", "bangalore", "blr", "ben"],
-            "chennai": ["chennai", "madras", "maa", "che"],
-            "mumbai": ["mumbai", "bombay", "bom", "mum"],
-            "trichy": ["trichy", "tiruchirappalli", "trz", "tri"],
-            "coimbatore": ["coimbatore", "cjb", "coi"]
+            "bengaluru": ["bengaluru", "bangalore", "blr", "ben", "ben_sh_xd_01"],
+            "chennai": ["chennai", "madras", "maa", "che", "che_sh_xd_01"],
+            "mumbai": ["mumbai", "bombay", "bom", "mum", "mum_sh_xd_01"],
+            "trichy": ["trichy", "tiruchirappalli", "trz", "tri", "tri_sh_xd_01"],
+            "coimbatore": ["coimbatore", "cjb", "coi", "coi_sh_xd_01"],
+            "jaipur": ["jaipur", "jai", "jpr", "jai_sh_xd_01", "rajasthan"],
         }.get(city_key, [city_key, city_label])
         df = df[df["City"].astype(str).str.strip().str.lower().isin(city_aliases)].copy()
         
@@ -930,6 +933,7 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
         "hyderabad": 13,
         "coimbatore": 90,
         "trichy": 102,
+        "jaipur": 19,
         "nashik": 8
     }
     city_id = db_city_map.get(city_key, 2)
@@ -962,7 +966,11 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
             if pd.isna(raw_vertical) or str(raw_vertical).strip().lower() == "nan":
                 raw_vertical = ""
                 
-        vertical = raw_vertical or m.get("vertical", "Staples")
+        title_val = str(row.get("Title", "") or row.get("FSN_Title", "")).lower()
+        if "egg" in str(raw_vertical).lower() or "anda" in str(raw_vertical).lower() or "egg" in title_val or "anda" in title_val:
+            vertical = "Eggs"
+        else:
+            vertical = raw_vertical or m.get("vertical", "Staples")
         tag = m.get("tag", "chiller")
         
         out.at[idx, "VERTICAL"] = vertical
@@ -982,6 +990,10 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
             out.at[idx, "Contract ID"] = "SHR-OR-01021287"
             out.at[idx, "Contract"] = "SHR-OR-01021287"
             out.at[idx, "Supplier ID"] = "OU56307764"
+        elif city_key == "jaipur":
+            out.at[idx, "Contract ID"] = "SHR-OR-01021287"
+            out.at[idx, "Contract"] = "SHR-OR-01021287"
+            out.at[idx, "Supplier ID"] = "OU83946715" if is_ambient else "OU77187305"
         else:
             out.at[idx, "Contract ID"] = "SHR-OR-01021287"
             out.at[idx, "Contract"] = "SHR-OR-01021287"
@@ -1036,6 +1048,7 @@ def filter_raw_indent_by_city(raw_indent_df: pd.DataFrame, city_key: str, city_l
             "coimbatore": ["coimbatore", "cjb", "coi", "coi_sh_xd_01"],
             "bengaluru": ["bengaluru", "bangalore", "blr", "ben", "ben_sh_xd_01"],
             "mumbai": ["mumbai", "bombay", "bom", "mum", "mum_sh_xd_01"],
+            "jaipur": ["jaipur", "jai", "jpr", "jai_sh_xd_01", "rajasthan"],
             "dehradun": ["dehradun", "deharadun", "ded"],
         }
         city_aliases = city_aliases_map.get(city_target, [city_target, city_label.lower()])
@@ -1075,6 +1088,13 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
     indent_df["Vertical"] = indent_df["VERTICAL"]
     indent_df = _coalesce_col(indent_df, "FSN_Title", ["FSN_Title", "Title", "FSN Title", "Title ", "Name", "title"])
     indent_df = _coalesce_col(indent_df, "Title", ["FSN_Title", "Title"])
+    
+    # Auto-tag eggs from item title if vertical is generic or missing
+    if "Title" in indent_df.columns:
+        is_egg_indent = indent_df["Title"].astype(str).str.lower().str.contains(r"\beggs?\b|\banda\b", regex=True)
+        indent_df.loc[is_egg_indent & (indent_df["VERTICAL"].isin(["", "Other", "Staples", "other"])), "VERTICAL"] = "Eggs"
+        indent_df["Vertical"] = indent_df["VERTICAL"]
+
     indent_df = _coalesce_col(indent_df, "Store", ["Store ID", "Store", "fc", "WH Code", "wh code", "Store ID/WH Code"])
     indent_df = _coalesce_col(indent_df, "Store ID", ["Store", "Store ID"])
     indent_df = _coalesce_col(indent_df, "Warehouse", ["Store Site ID", "Warehouse", "WH Name", "Warehouse Name"])
@@ -1116,6 +1136,13 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
             addon_processed = _coalesce_col(addon_processed, "Vertical", ["VERTICAL", "Vertical"])
             addon_processed["VERTICAL"] = addon_processed["VERTICAL"].apply(normalize_vertical)
             addon_processed["Vertical"] = addon_processed["VERTICAL"]
+            
+            # Auto-tag eggs from title in add-ons
+            if "Title" in addon_processed.columns or "FSN_Title" in addon_processed.columns:
+                title_col_name = "Title" if "Title" in addon_processed.columns else "FSN_Title"
+                is_egg_addon = addon_processed[title_col_name].astype(str).str.lower().str.contains(r"\beggs?\b|\banda\b", regex=True)
+                addon_processed.loc[is_egg_addon & (addon_processed["VERTICAL"].isin(["", "Other", "Staples", "other"])), "VERTICAL"] = "Eggs"
+                addon_processed["Vertical"] = addon_processed["VERTICAL"]
             addon_processed = _coalesce_col(addon_processed, "Store", ["Store ID", "Store", "WH Code", "fc"])
             addon_processed = _coalesce_col(addon_processed, "Warehouse", ["Store Site ID", "Warehouse", "WH Name", "Warehouse Name"])
             addon_processed = _coalesce_col(addon_processed, "Qty", ["QTY", "PO qty", "Qty", "Final PO", "Final_Quantity"])
@@ -1492,9 +1519,9 @@ def build_excel_report(target_date: date, output_path: str, city_key: str = "tri
     ws_stores.column_dimensions[get_column_letter(7)].width = 25
     ws_stores.column_dimensions[get_column_letter(8)].width = 25
 
-    if city_key in ["mumbai", "bengaluru", "chennai"]:
+    egg_df = build_egg_pivot(po_df)
+    if not egg_df.empty or city_key in ["mumbai", "bengaluru", "chennai", "jaipur"]:
         ws_eggs = wb.create_sheet("Eggs")
-        egg_df = build_egg_pivot(po_df)
         
         _write_df_to_sheet(
             ws_eggs, egg_df,
