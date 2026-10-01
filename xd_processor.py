@@ -900,31 +900,34 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
     else:
         out["City"] = CITIES[city_key]["label"] if city_key in CITIES else ""
         
-    wh_code_col = next((c for c in ["DS", "ds", "WH Code", "WH code", "wh code", "Store ID", "Store", "WH", "Store ID/WH Code", "fc", "wh_code"] if c in df.columns), None)
+    wh_code_col = next((c for c in ["DS", "ds", "WH Code", "WH code", "wh code", "Store ID", "Store", "WH", "Store ID/WH Code", "fc", "wh_code", "store"] if c in df.columns), None)
     store_id_series = df[wh_code_col].astype(str).str.strip() if wh_code_col else ""
     out["Store ID"] = store_id_series
     out["Store"] = store_id_series
     
-    wh_name_col = next((c for c in ["Warehouse Name", "warehouse name", "WH Name", "Store Site ID", "Warehouse"] if c in df.columns), None)
+    wh_name_col = next((c for c in ["Warehouse Name", "warehouse name", "WH Name", "Store Site ID", "Warehouse", "fc_name", "parent_fc", "warehouse"] if c in df.columns), None)
     site_id_series = df[wh_name_col].astype(str).str.strip() if wh_name_col else ""
     out["Store Site ID"] = site_id_series
     out["Warehouse"] = site_id_series
     
     out["FSN"] = df[fsn_col].astype(str).str.strip() if fsn_col else ""
     
-    qty_col = next((c for c in ["Final PO", "final po", "PO qty", "Qty", "QTY", "Quantity", "qty"] if c in df.columns), None)
+    qty_col = next((c for c in ["Final PO", "final po", "PO qty", "Qty", "QTY", "Quantity", "qty", "final_quantity", "Final_Quantity", "final quantity", "Final Quantity", "Final_Qty", "final_qty"] if c in df.columns), None)
+    if not qty_col:
+        qty_col = next((c for c in df.columns if any(k in str(c).lower() for k in ["final_quantity", "final quantity", "po qty", "final po", "qty", "quantity"])), None)
     qty_series = pd.to_numeric(df[qty_col], errors="coerce").fillna(0) if qty_col else 0
     out["Qty"] = qty_series
     out["QTY"] = qty_series
     out["PO qty"] = qty_series
     
-    title_col = next((c for c in ["Title", "title", "FSN Title", "FSN_Title", "Name"] if c in df.columns), None)
+    title_col = next((c for c in ["Title", "title", "FSN Title", "FSN_Title", "Name", "name", "title "] if c in df.columns), None)
     title_series = df[title_col].astype(str).str.strip() if title_col else ""
     out["Title"] = title_series
     out["FSN_Title"] = title_series
     
     out["SLA"] = "7"
-    out["Brand"] = ""
+    brand_col = next((c for c in ["Brand", "brand", "Brand Name", "Brand_Name", "brand_name"] if c in df.columns), None)
+    out["Brand"] = df[brand_col].astype(str).str.strip() if brand_col else ""
     
     db_city_map = {
         "bengaluru": 2,
@@ -947,11 +950,11 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
     out["Vertical"] = ""
     out["tag"] = ""
     
-    contract_col = next((c for c in ["Contract", "Contract ID"] if c in df.columns), None)
+    contract_col = next((c for c in ["Contract", "Contract ID", "Current Contract Id", "Current Contract ID", "contract_id", "contract"] if c in df.columns), None)
     out["Contract ID"] = df[contract_col].astype(str).str.strip() if contract_col else ""
-    out["Contract"] = df[contract_col].astype(str).str.strip() if contract_col else ""
+    out["Contract"] = out["Contract ID"]
     
-    supplier_col = next((c for c in ["OUID", "Supplier ID"] if c in df.columns), None)
+    supplier_col = next((c for c in ["OUID", "Supplier ID", "Current Supplier Id", "Current Supplier ID", "supplier_id", "ouid"] if c in df.columns), None)
     out["Supplier ID"] = df[supplier_col].astype(str).str.strip() if supplier_col else ""
 
     out["Chiller/Non chiller Tag"] = ""
@@ -979,30 +982,39 @@ def process_addon_df(addon_raw: pd.DataFrame, city_key: str, is_staples: bool = 
         out.at[idx, "Chiller/Non chiller Tag"] = tag
         
         is_ambient = "amb" in tag
-        if city_key == "mumbai":
-            out.at[idx, "Contract ID"] = "SHR-OR-01062967"
-            out.at[idx, "Contract"] = "SHR-OR-01062967"
-            if is_ambient:
-                out.at[idx, "Supplier ID"] = "OU49532875"
-            else:
-                out.at[idx, "Supplier ID"] = "OU42311586"
-        elif city_key == "chennai":
-            out.at[idx, "Contract ID"] = "SHR-OR-01021287"
-            out.at[idx, "Contract"] = "SHR-OR-01021287"
-            out.at[idx, "Supplier ID"] = "OU56307764"
-        elif city_key == "jaipur":
-            out.at[idx, "Contract ID"] = "SHR-OR-01021287"
-            out.at[idx, "Contract"] = "SHR-OR-01021287"
-            out.at[idx, "Supplier ID"] = "OU83946715" if is_ambient else "OU77187305"
+        existing_contract = str(row.get("Contract ID", "")).strip()
+        existing_supplier = str(row.get("Supplier ID", "")).strip()
+        
+        if existing_contract and existing_contract.lower() != "nan":
+            out.at[idx, "Contract ID"] = existing_contract
+            out.at[idx, "Contract"] = existing_contract
         else:
-            out.at[idx, "Contract ID"] = "SHR-OR-01021287"
-            out.at[idx, "Contract"] = "SHR-OR-01021287"
-            if is_staples and city_key in ["bengaluru", "blr"]:
-                out.at[idx, "Supplier ID"] = "OU83946700"
-            elif is_ambient:
-                out.at[idx, "Supplier ID"] = "OU83946715"
+            if city_key == "mumbai":
+                out.at[idx, "Contract ID"] = "SHR-OR-01062967"
+                out.at[idx, "Contract"] = "SHR-OR-01062967"
+            elif city_key == "chennai":
+                out.at[idx, "Contract ID"] = "SHR-OR-01021287"
+                out.at[idx, "Contract"] = "SHR-OR-01021287"
             else:
-                out.at[idx, "Supplier ID"] = "OU77187305"
+                out.at[idx, "Contract ID"] = "SHR-OR-01021287"
+                out.at[idx, "Contract"] = "SHR-OR-01021287"
+
+        if existing_supplier and existing_supplier.lower() != "nan":
+            out.at[idx, "Supplier ID"] = existing_supplier
+        else:
+            if city_key == "mumbai":
+                out.at[idx, "Supplier ID"] = "OU49532875" if is_ambient else "OU42311586"
+            elif city_key == "chennai":
+                out.at[idx, "Supplier ID"] = "OU56307764"
+            elif city_key == "jaipur":
+                out.at[idx, "Supplier ID"] = "OU83946715" if is_ambient else "OU77187305"
+            else:
+                if is_staples and city_key in ["bengaluru", "blr"]:
+                    out.at[idx, "Supplier ID"] = "OU83946700"
+                elif is_ambient:
+                    out.at[idx, "Supplier ID"] = "OU83946715"
+                else:
+                    out.at[idx, "Supplier ID"] = "OU77187305"
         
     if is_staples and city_key in ["bengaluru", "blr"]:
         out["Supplier ID"] = "OU83946700"
